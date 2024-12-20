@@ -4,11 +4,14 @@ import { config } from "dotenv";
 import fs from "fs";
 import path from "path";
 import mysql, { RowDataPacket } from "mysql2/promise";
-import JudgeServer from "./judge/judge";
+import Server, { Result } from "./judge/protocol";
 import http from "http";
 import https from "https";
 import getInnerAPI from "./innerAPI";
+import cookieParser from "cookie-parser";
 config({ path: path.join(__dirname, "./../../.env") });
+
+console.log("Application is running in:", process.env.NODE_ENV);
 
 async function sendDiscord(value: string) {
 
@@ -38,7 +41,7 @@ async function sendDiscord(value: string) {
 
 }
 
-const front = next({ dir: "../front", dev: process.argv.indexOf("--dev") != -1 });
+const front = next({ dir: "../front", dev: process.env.NODE_ENV == "development" });
 
 front.prepare().then(async () => {
 
@@ -52,45 +55,12 @@ front.prepare().then(async () => {
 	});
 
 	const tasks = (await sql.query("SELECT id, judge_type FROM tasks;"))[0] as RowDataPacket[];
-	const judgeServer = new JudgeServer({});
+	const judgeServer = new Server();
 
 	function loadTestcases(id: string) {
 
-		const testcaseDirs = fs.readdirSync(path.join("./static/testcases", id));
+		judgeServer.loadTask(id);
 
-		judgeServer.problems[id] = { testcases: [], options: {} };
-
-		testcaseDirs.forEach(testcase => {
-
-			const tests = fs.readdirSync(path.join("./static/testcases", id, testcase));
-
-			const dependencies = JSON.parse(fs.readFileSync(path.join("./static/testcases", id, testcase, "dependencies.json"), 'utf-8'));
-
-			judgeServer.problems[id].testcases.push({ id: testcase, tests: [], dependencies });
-
-			tests.forEach(test => {
-
-				if (!fs.statSync(path.join("./static/testcases", id, testcase, test)).isDirectory()) return;
-
-				const { type, score, outcheck, interactive } = JSON.parse(fs.readFileSync(path.join("./static/testcases", id, testcase, test, "config.json"), 'utf-8'));
-
-				if (type == "plane") {
-
-					judgeServer.problems[id].testcases[judgeServer.problems[id].testcases.length - 1].tests.push({ id: test, input: path.join("./static/testcases", id, testcase, test, "in.txt"), output: path.join("./static/testcases", id, testcase, test, "out.txt"), score });
-
-				} else if (type == "outcheck") {
-
-					judgeServer.problems[id].testcases[judgeServer.problems[id].testcases.length - 1].tests.push({ id: test, input: path.join("./static/testcases", id, testcase, test, "in.txt"), check: path.join("./static/testcases", id, testcase, test, outcheck), score });
-
-				} else if (type == "interactive") {
-
-					judgeServer.problems[id].testcases[judgeServer.problems[id].testcases.length - 1].tests.push({ id: test, interactive: path.join("./static/testcases", id, testcase, test, interactive) });
-
-				}
-
-			});
-
-		});
 	}
 
 	tasks.forEach((task) => {
@@ -101,12 +71,49 @@ front.prepare().then(async () => {
 
 	});
 
+	judgeServer.server.listen(6431, "0.0.0.0");
+
+	const judging: { [key: string]: boolean } = {};
+
 	// judgeServer.addQueue(sql, "test");
 	setInterval(() => {
-		judgeServer.updateQueue(sql);
-	}, 1500);
 
-	app.use((req, res, next) => {
+		sql.query<RowDataPacket[]>("SELECT * FROM submissions WHERE judge = 'WJ';").then((datas) => {
+
+			for (const data of datas[0]) {
+
+				if (judging[data.id]) continue;
+				judging[data.id] = true;
+
+				judgeServer.addSubmission(data.id, data.task, data.language, data.sourceCode).then((result) => {
+
+					if (!result) {
+
+						sql.query("UPDATE submissions SET judge = '[[8, 0], [], []]' WHERE id = ?;", [data.id]);
+
+					} else if (result.message != "") {
+
+						sql.query("UPDATE submissions SET judge = ? WHERE id = ?;", [JSON.stringify({ status: result.result[0][0], message: result.message }), data.id]);
+
+					} else {
+
+						sql.query("UPDATE submissions SET judge = ? WHERE id = ?;", [JSON.stringify(result.result), data.id]);
+
+					}
+
+					delete judging[data.id];
+
+				});
+
+			}
+
+		});
+
+	}, 100);
+
+	app.use(cookieParser());
+
+	app.use(async (req, res, next) => {
 		if (req.path.endsWith("/") && req.path.length > 1) {
 			const query = req.url.slice(req.path.length)
 			res.redirect(301, req.path.slice(0, -1) + query)
@@ -115,24 +122,59 @@ front.prepare().then(async () => {
 		}
 	})
 
+	app.use("/signup", async (req, res, next) => {
+
+		if (process.env.NODE_ENV == "production") {
+			const status = await fetch("https://verify.w-pcp.dev/verify?token=" + req.cookies.di_token).then((res) => res.status)
+			if (status != 200) {
+				res.redirect("https://discord.com/oauth2/authorize?client_id=1251095772288778251&response_type=code&redirect_uri=https%3A%2F%2Fverify.w-pcp.dev&scope=guilds");
+				return;
+			}
+		}
+
+		next();
+
+	})
+
 	const files = fs.readdirSync(path.join(__dirname, "routes"));
 
 	for (let i = 0; i < files.length; i++) {
 		const p = path.parse(files[i]);
+
 		if (p.name.startsWith('@')) continue;
+
 		if (fs.statSync(path.join(__dirname, "./routes", files[i])).isFile()) {
+
 			if (files[i] == 'index.js' || files[i].endsWith('/index.js')) {
+
 				const input = (await import(path.join(__dirname, "./routes", files[i])));
-				app.use(path.join("/", files[i], '../'), input.default(sql, judgeServer));
+
+				let func = input.default(sql, judgeServer);
+
+				app.use(path.join("/api", files[i], '../'), (req, res, next) => {
+
+					return func(req, res, next);
+
+				});
+
 				console.log(`Loaded ${path.join(__dirname, "./routes", files[i])} as ${path.join("/", files[i], '../')}`);
+
 			} else {
+
 				const input = (await import(path.join(__dirname, "./routes", files[i])));
-				app.use(path.join("/", files[i].replace(/\.js$/, "")), input.default(sql, judgeServer));
+
+				app.use(path.join("/api", files[i].replace(/\.js$/, "")), input.default(sql, judgeServer));
+
 				console.log(`Loaded ${path.join(__dirname, "./routes", files[i])} as ${path.join("/", files[i].replace(/\.js$/, ""))}`);
+
 			}
+
 		} else {
+
 			files.push(...fs.readdirSync(path.join(__dirname, "./routes", files[i])).map((file) => path.join(files[i], file)));
+
 		}
+
 	}
 
 	console.log("All files loaded");
@@ -203,8 +245,17 @@ front.prepare().then(async () => {
 
 	(await getInnerAPI(judgeServer, loadTestcases)).listen(9834, "localhost");
 
-	http.createServer((rep, res) => res.writeHead(301, { Location: `https://${rep.headers.host}${rep.url}` }).end()).listen(80);
-	https.createServer({ cert: fs.readFileSync(path.join(__dirname, "./../../certs/cert.pem")), key: fs.readFileSync(path.join(__dirname, "./../../certs/key.pem")) }, app).listen(process.env.port ? Number(process.env.port) : 443, "0.0.0.0")
+	const portRequest = await fetch("http://localhost:8290/add", {
+		body: JSON.stringify({
+			host: "judge.w-pcp.net"
+		}),
+		headers: {
+			"Content-Type": "application/json"
+		},
+		method: "POST",
+	}).then((res) => res.json()).catch(() => { port: process.env.port });
+	console.log(portRequest);
+	http.createServer({}, app).listen(process.env.port ? Number(process.env.port) : portRequest.port, process.env.domain)
 });
 
 type Router = ((sql: mysql.Connection) => express.Router);

@@ -18,8 +18,9 @@ cd atsuo-coder/api
 npm run build
 ```
 
-実行する前に、 `api/static/testcases/.gitkeep` を削除してください。
-また、 `sample.env` を参考に同じ内容のファイル `.env`、`front/.env` を作成してください。
+- `api/static/testcases/.gitkeep` を削除してください。
+-  `sample.env` を参考に同じ内容のファイル `.env`、`front/.env` を作成してください。
+- `judge-docker/dockerfile` において `CMD ["npm", "start", "localhost", "6431"]` の行のうち `localhost` をサーバーのIP等に変更してください。ただし、ローカルの際は `localhost` となります。また、`6431` はポート番号です。`api/src/index.ts:72` にサーバーの起動命令とともにポートの指定があります。
 
 ### MySQL
 

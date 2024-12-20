@@ -1,7 +1,7 @@
 import express from "express";
-import JudgeServer from "src/judge/judge";
+import Server from "src/judge/protocol";
 
-export default async function getInnerAPI(judgeServer: JudgeServer, loadTestcases: (id: string) => void) {
+export default async function getInnerAPI(judgeServer: Server, loadTestcases: (id: string) => void) {
 
 	const innerAPI = express();
 
@@ -9,10 +9,9 @@ export default async function getInnerAPI(judgeServer: JudgeServer, loadTestcase
 
 	innerAPI.get("/testcases/:task/reload", (req, res) => {
 
-		judgeServer.locked[req.params.task] = true;
-		judgeServer.problems[req.params.task] = { testcases: [], options: {} };
-		loadTestcases(req.params.task);
-		delete judgeServer.locked[req.params.task];
+		judgeServer.loadTask(req.params.task);
+
+		res.end("OK");
 
 	});
 
